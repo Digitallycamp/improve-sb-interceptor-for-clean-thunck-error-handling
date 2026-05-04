@@ -102,140 +102,74 @@ const processQueue = (error: unknown, token: string | null = null) => {
 
 api.interceptors.response.use(
   (response) => response,
-  (error) => {
-    // This is the "Shield" logic
+  async (error) => {
+    const originalRequest = error.config as CustomAxiosRequestConfig;
+
+    // 1. HANDLER: TOKEN REFRESH LOGIC
+    // We only try to refresh if it's a 401 and not an auth/refresh route
+    const shouldAttemptRefresh = 
+      error.response?.status === 401 && 
+      !originalRequest._retry && 
+      !originalRequest.url?.includes('/admin/auth/refresh-token/exchange') &&
+      !isAuthRoute(originalRequest.url) &&
+      !isFrontendAuthRoute();
+
+    if (shouldAttemptRefresh) {
+      if (!tokenStore.get()) return Promise.reject(error);
+
+      if (isRefreshing) {
+        return new Promise((resolve, reject) => {
+          failedQueue.push({ resolve, reject });
+        }).then((token) => {
+          originalRequest.headers!['Authorization'] = `Bearer ${token}`;
+          return api(originalRequest);
+        });
+      }
+
+      originalRequest._retry = true;
+      isRefreshing = true;
+
+      try {
+        const newToken = await getRefreshPromise(/* ... your refresh logic ... */);
+        tokenStore.set(newToken);
+        isRefreshing = false;
+        processQueue(null, newToken);
+        
+        originalRequest.headers!['Authorization'] = `Bearer ${newToken}`;
+        return api(originalRequest);
+      } catch (refreshError: any) {
+        isRefreshing = false;
+        processQueue(refreshError, null);
+        tokenStore.clear();
+        if (refreshError.response?.status === 401) onAuthFailure?.();
+        
+        // Pass the error down to the "Shield" logic below
+        error = refreshError; 
+      }
+    }
+
+    // 2. THE SHIELD: NORMALIZE ERROR
+    // This runs for EVERY error that wasn't fixed by the refresh logic
     let normalizedError: ApiError = {
       message: 'An unexpected error occurred.',
     };
 
     if (error.response) {
-      // Server responded with a status code outside 2xx
       normalizedError = {
         message: error.response.data?.message || 'Server Error',
         code: error.response.status,
-        errors: error.response.data?.errors, 
+        errors: error.response.data?.errors,
       };
     } else if (error.request) {
-      // Request was made but no response received (Network issues)
       normalizedError = {
         message: 'Network error. Please check your connection.',
         code: 'NETWORK_ERROR',
       };
     } else {
-      // Something else happened in setting up the request
       normalizedError.message = error.message;
     }
 
-    // CRITICAL: We return a rejected promise with the NEW object
     return Promise.reject(normalizedError);
-  }
-);
-api.interceptors.response.use(
-  (response) => response,
-  async (error) => {
-    if (!error.config || !error.response) {
-      return Promise.reject(error);
-    }
-    const originalRequest = error.config as CustomAxiosRequestConfig;
-
-    const isRefreshCall = originalRequest.url?.includes(
-      '/admin/auth/refresh-token/exchange'
-    );
-
-    const isAuthCall = isAuthRoute(originalRequest.url);
-
-    if (
-      error.response?.status !== 401 ||
-      originalRequest._retry ||
-      isRefreshCall ||
-      isAuthCall ||
-      isFrontendAuthRoute()
-    ) {
-      return Promise.reject(error);
-    }
-
-    //  no token , don't refresh
-    if (!tokenStore.get()) {
-      return Promise.reject(error);
-    }
-
-    // don't refresh on auth pages
-    if (isFrontendAuthRoute()) {
-      return Promise.reject(error);
-    }
-    // ---- Queue while refreshing ----
-    if (isRefreshing) {
-      return new Promise<string | null>((resolve, reject) => {
-        failedQueue.push({ resolve, reject });
-      }).then((token) => {
-        if (!token) return Promise.reject(new Error('No token'));
-
-        originalRequest.headers = originalRequest.headers || {};
-        originalRequest.headers['Authorization'] = `Bearer ${token}`;
-
-        return api(originalRequest);
-      });
-    }
-
-    originalRequest._retry = true;
-    isRefreshing = true;
-
-    try {
-      const newToken = await getRefreshPromise(
-        async () => {
-          const { data } = await refreshClient.post(
-            '/admin/auth/refresh-token/exchange',
-            {},
-            { withCredentials: true }
-          );
-
-          if (!data.data.access_token) {
-            throw new Error('Invalid refresh response');
-          }
-
-          return data.data.access_token;
-        },
-        (token) => {
-          tokenStore.set(token);
-        },
-        () => {
-          tokenStore.clear();
-        }
-      );
-      tokenStore.set(newToken);
-
-      // ---- Important: release lock BEFORE resolving queue ----
-      isRefreshing = false;
-      processQueue(null, newToken);
-
-      originalRequest.headers = {
-        ...(originalRequest.headers || {}),
-        Authorization: `Bearer ${newToken}`,
-      };
-
-      return api(originalRequest);
-    } catch (err: any) {
-      tokenStore.clear();
-
-      // ---- Network vs Auth failure ----
-      if (!err?.response) {
-        // Network issue → reject queue but DON'T force logout
-        isRefreshing = false;
-        processQueue(err, null);
-        return Promise.reject(err);
-      }
-
-      // Auth failure → logout
-      isRefreshing = false;
-      processQueue(err, null);
-
-      // logout if it's truly auth failure
-      if (err?.response?.status === 401) {
-        onAuthFailure?.();
-      }
-
-      return Promise.reject(err);
-    }
   }
 );
 
