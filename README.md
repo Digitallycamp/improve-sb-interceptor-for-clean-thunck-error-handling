@@ -7,6 +7,13 @@ import axios, { type AxiosRequestConfig } from 'axios';
 import { tokenStore } from './tokenStore';
 import { getRefreshPromise } from './refreshManager';
 
+// . Define a standard error structure
+export interface ApiError {
+  message: string;
+  code?: string | number;
+  errors?: Record<string, string[]>; // For validation errors
+}
+
 interface CustomAxiosRequestConfig extends AxiosRequestConfig {
   _retry?: boolean;
 }
@@ -91,14 +98,7 @@ const processQueue = (error: unknown, token: string | null = null) => {
 };
 
 // ---- Response interceptor ----
-// Add this to your api client file
 
-// 1. Define a standard error structure
-export interface ApiError {
-  message: string;
-  code?: string | number;
-  errors?: Record<string, string[]>; // For validation errors
-}
 
 api.interceptors.response.use(
   (response) => response,
